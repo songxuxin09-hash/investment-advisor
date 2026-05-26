@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://investment-advisor-api.vercel.app/api/:path*" }
+  ]
+}
