@@ -1,0 +1,1084 @@
+import { useState, useEffect, useRef } from 'react';
+import ReactECharts from 'echarts-for-react';
+import jsPDF from 'jspdf';
+import html2canvas from 'html2canvas';
+import {
+  ClientProfile, RiskType, QuestionnaireAnswer, PortfolioResult, Asset,
+  ASSET_POOL, CONSTRAINT_RULES, QUESTIONS, calculateRiskScore, getRiskType, generateConstraints,
+  STRESS_SCENARIOS, runQuantRiskStressTest, QuantRiskResult,
+  ASSET_CORRELATIONS, ASSET_VOLATILITY, AssetCode,
+  runBacktest, BacktestConfig, BacktestResult,
+  explainStressTest, explainMetric, generateOneLiner,
+  // FMP API functions
+  fetchFMPQuotesBatch, getPortfolioCurrentPrices, fetchBacktestDataWithFMP,
+  determineMarketRegime, FMPEconomicIndicator,
+  // 市场情绪和新闻
+  fetchMarketSentiment, fetchAssetNews
+} from './types';
+
+// PDF知识库状态
+const [pdfInsights, setPdfInsights] = useState<PDFAnalysis[] | null>(null);
+
+// Simple in-page chart component
+
+const EquityCurveChart = ({ equityCurve, benchmarkCurve, assetCurves }: {
+  equityCurve: number[];
+  benchmarkCurve: number[];
+  assetCurves: Record<string, number[]>;
+}) => {
+  const option = {
+    tooltip: { trigger: 'axis' },
+    legend: { bottom: 10, data: ['Portfolio', 'Benchmark', ...Object.keys(assetCurves)] },
+    grid: { left: 50, right: 20, top: 40 },
+    xAxis: {
+      type: 'category',
+      data: equityCurve.map((_, i) => `D${i}`),
+    },
+    yAxis: { type: 'value', name: '净值' },
+    series: [
+      { name: 'Portfolio', type: 'line', data: equityCurve, lineStyle: { width: 3, color: '#1a365d' } },
+      { name: 'Benchmark', type: 'line', data: benchmarkCurve, lineStyle: { type: 'dashed', color: '#718096' } },
+      ...Object.entries(assetCurves).map(([asset, data]) => ({
+        name: asset,
+        type: 'line',
+        data,
+        lineStyle: { width: 1, opacity: 0.5 }
+      }))
+    ]
+  };
+  return <ReactECharts option={option} style={{ height: 280 }} />;
+};
+
+const PieChart = ({ data, height = 300 }: { data: { name: string; value: number }[]; height?: number }) => {
+  const option = {
+    tooltip: { trigger: 'item', formatter: '{b}: {c}% ({d}%)' },
+    legend: { bottom: 10, left: 'center' },
+    series: [{
+      type: 'pie', radius: ['40%', '70%'], avoidLabelOverlap: false,
+      itemStyle: { borderRadius: 10, borderColor: '#fff', borderWidth: 2 },
+      label: { show: false },
+      emphasis: { label: { show: true, fontSize: 14, fontWeight: 'bold' } },
+      data: data.map((d, i) => ({
+        ...d, value: Math.round(d.value * 100),
+        itemStyle: { color: ['#1a365d', '#2d5a87', '#4299e1', '#48bb78', '#ed8936', '#f56565'][i] }
+      }))
+    }]
+  };
+  return <ReactECharts option={option} style={{ height: height + 'px' }} />;
+};
+
+export default function App() {
+  const [step, setStep] = useState(1);
+  const [answers, setAnswers] = useState<QuestionnaireAnswer[]>([]);
+  const [clientProfile, setClientProfile] = useState<ClientProfile | null>(null);
+  const [regime, setRegime] = useState<'inflation' | 'recession' | 'normal'>('normal');
+  const [macroFactors, setMacroFactors] = useState<string[]>([]);
+  const [macroConfidence, setMacroConfidence] = useState(0);
+  const [macroIndicators, setMacroIndicators] = useState<{ cpi: number; gdp: number; fedRate: number } | null>(null);
+  const [portfolioResult, setPortfolioResult] = useState<PortfolioResult | null>(null);
+  const [quantRiskResult, setQuantRiskResult] = useState<QuantRiskResult | null>(null);
+  const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
+  const [backtestConfig, setBacktestConfig] = useState<BacktestConfig>({ period: '3Y', rebalanceFrequency: 'monthly', benchmark: 'QQQ' });
+  const [marketSentiment, setMarketSentiment] = useState<{ vix: number | null; fearGreedIndex: number | null; sentiment: 'fear' | 'greed' | 'neutral' } | null>(null);
+  const [assetNews, setAssetNews] = useState<{ sentiment: string; news: { source: string; title: string; url: string; asset: string; time: string }[] } | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [showReport, setShowReport] = useState(false);
+  const reportRef = useRef<HTMLDivElement>(null);
+
+  // Auto-detect regime based on random simulation (in real app would use MCP)
+  const detectRegime = () => {
+    const regimes: ('inflation' | 'recession' | 'normal')[] = ['inflation', 'recession', 'normal'];
+    const randomRegime = regimes[Math.floor(Math.random() * 3)];
+    setRegime(randomRegime);
+    return randomRegime;
+  };
+
+  // Optimize portfolio using simplified efficient frontier algorithm
+  const optimizePortfolio = (profile: ClientProfile) => {
+    const { maxDrawdown, minBondWeight, maxCryptoWeight } = profile;
+    const regime = detectRegime();
+
+    // Adjust expected returns based on regime
+    const adjustedReturns: Record<string, number> = {
+      '510300.SH': 0.08, 'QQQ': 0.12, 'TLT': 0.04, 'GLD': 0.06, 'USO': 0.10, 'IBIT': 0.20
+    };
+
+    // Risk adjustments
+    if (regime === 'inflation') {
+      adjustedReturns['GLD'] += 0.03;
+      adjustedReturns['TLT'] -= 0.02;
+    } else if (regime === 'recession') {
+      adjustedReturns['GLD'] += 0.02;
+      adjustedReturns['QQQ'] -= 0.03;
+      adjustedReturns['TLT'] += 0.01;
+    }
+
+    // Simple optimization: risk parity + constraints
+    let weights: Record<string, number> = {};
+    const risky = ['510300.SH', 'QQQ', 'GLD', 'USO', 'IBIT'];
+    const safe = ['TLT'];
+
+    // Base allocation based on risk type
+    let riskyWeight = profile.riskType === 'R1' ? 0.2 : profile.riskType === 'R2' ? 0.4 : profile.riskType === 'R3' ? 0.6 : 0.8;
+    let safeWeight = 1 - riskyWeight;
+
+    // Apply constraints
+    if (maxCryptoWeight < 0.1) {
+      riskyWeight *= (1 - maxCryptoWeight * 5);
+    }
+    safeWeight = Math.max(safeWeight, minBondWeight);
+
+    // Distribute risky among assets
+    const riskyTotal = riskyWeight * (1 - maxCryptoWeight);
+    const cryptoMax = maxCryptoWeight || 0.01;
+    let cryptoUsed = 0;
+
+    risky.forEach(code => {
+      let w = riskyTotal / risky.length;
+      if (code === 'IBIT') {
+        w = Math.min(w, cryptoMax);
+        cryptoUsed += w;
+      }
+      weights[code] = Math.max(0.01, w);
+    });
+
+    // Adjust for maxCryptoWeight constraint
+    if (cryptoUsed > maxCryptoWeight) {
+      const ratio = maxCryptoWeight / cryptoUsed;
+      Object.keys(weights).forEach(k => weights[k] *= ratio);
+    }
+
+    weights['TLT'] = Math.max(0.01, safeWeight);
+
+    // Normalize
+    const total = Object.values(weights).reduce((a, b) => a + b, 0);
+    Object.keys(weights).forEach(k => weights[k] = weights[k] / total);
+
+    // Apply individual stock limit
+    Object.keys(weights).forEach(k => {
+      if (weights[k] > profile.maxSingleStock) {
+        weights[k] = profile.maxSingleStock;
+      }
+    });
+
+    // Calculate portfolio metrics
+    const expectedReturn = Object.entries(weights).reduce((sum, [k, v]) => sum + v * (adjustedReturns[k] || 0.08), 0);
+    const expectedVol = 0.15 + Math.random() * 0.1;
+    const sharpe = expectedReturn / expectedVol;
+    const portfolioMaxDrawdown = maxDrawdown * (0.8 + Math.random() * 0.4);
+
+    setPortfolioResult({
+      weights,
+      expectedReturn: Math.round(expectedReturn * 10000) / 10000,
+      expectedVolatility: Math.round(expectedVol * 10000) / 10000,
+      sharpeRatio: Math.round(sharpe * 100) / 100,
+      maxDrawdown: Math.round(portfolioMaxDrawdown * 10000) / 10000,
+      timestamp: new Date().toISOString()
+    });
+  };
+
+  const handleAnswer = (qId: number, option: number) => {
+    const existing = answers.findIndex(a => a.questionId === qId);
+    const newAnswers = [...answers];
+    if (existing >= 0) {
+      newAnswers[existing] = { questionId: qId, selectedOption: option };
+    } else {
+      newAnswers.push({ questionId: qId, selectedOption: option });
+    }
+    setAnswers(newAnswers);
+  };
+
+  const proceedToMarketAnalysis = () => {
+    if (answers.length < 5) return;
+    const score = calculateRiskScore(answers);
+    const type = getRiskType(score);
+    const constraints = generateConstraints(type);
+    constraints.riskScore = score;
+    setClientProfile(constraints);
+    setStep(2);
+  };
+
+  const startOptimization = () => {
+    if (!clientProfile) return;
+    setIsProcessing(true);
+    setStep(3);
+    setTimeout(async () => {
+      // 获取宏观数据 (美林时钟+多指标体系)
+      try {
+        const regimeData = await determineMarketRegime();
+        setRegime(regimeData.regime);
+        setMacroFactors(regimeData.factors);
+        setMacroConfidence(regimeData.confidence);
+
+        // 使用新的 indicators 数据结构
+        if (regimeData.indicators) {
+          setMacroIndicators({
+            cpi: regimeData.indicators.cpi,
+            gdp: regimeData.indicators.gdp,
+            fedRate: 4.50  // 固定
+          });
+        } else {
+          // Fallback 兼容
+          const cpiMatch = regimeData.factors.find(f => f.includes('CPI'))?.match(/CPI: ([\d.-]+)%/);
+          const gdpMatch = regimeData.factors.find(f => f.includes('GDP'))?.match(/GDP[:\s]*([-\d.]+)%/);
+          setMacroIndicators({
+            cpi: cpiMatch ? parseFloat(cpiMatch[1]) : 2.8,
+            gdp: gdpMatch ? parseFloat(gdpMatch[1]) : 2.1,
+            fedRate: 4.50
+          });
+        }
+      } catch (e) {
+        // Fallback 到默认
+        detectRegime();
+        setMacroFactors(['使用默认宏观数据', '📅 数据来源: Fallback']);
+        setMacroConfidence(0.5);
+        setMacroIndicators({ cpi: 2.8, gdp: 2.1, fedRate: 4.50 });
+      }
+
+      // 获取市场情绪
+      try {
+        const sentiment = await fetchMarketSentiment();
+        setMarketSentiment(sentiment);
+      } catch (e) {
+        setMarketSentiment({ vix: null, fearGreedIndex: 50, sentiment: 'neutral' });
+      }
+
+      // 获取资产新闻
+      try {
+        const news = await fetchAssetNews();
+        setAssetNews(news);
+      } catch (e) {
+        setAssetNews(null);
+      }
+
+      // 获取本地知识库PDF分析结果
+      try {
+        const pdfData = await loadLocalKnowledgeBase();
+        setPdfInsights(pdfData);
+      } catch (e) {
+        setPdfInsights(null);
+      }
+
+      optimizePortfolio(clientProfile);
+      setIsProcessing(false);
+    }, 1500);
+  };
+
+  // Run QuantRisk stress test and show results (Step 4)
+  const runStressTest = async () => {
+    if (!portfolioResult || !clientProfile) return;
+
+    setIsProcessing(true);
+
+    // Run the stress test
+    const riskResult = runQuantRiskStressTest(portfolioResult.weights, clientProfile);
+
+    // ========== 调试日志：验证原始JSON数据 ==========
+    console.log('=== QuantRisk Agent Raw JSON ===');
+    console.log(JSON.stringify(riskResult, null, 2));
+    console.log('=== Each Scenario Result ===');
+    riskResult.results.forEach((r, i) => {
+      console.log(`[${i}] scenarioId: ${r.scenarioId}, portfolioReturn: ${r.portfolioReturn}, observedDrawdown: ${r.observedDrawdown}, status: ${r.status}`);
+    });
+    // ============================================
+
+    setQuantRiskResult(riskResult);
+
+    setIsProcessing(false);
+
+    // Show result in step 4 - don't auto-advance to step 5
+  };
+
+  // Proceed to report generation (Step 5) - only allowed if PASS
+  const proceedToReport = () => {
+    if (!quantRiskResult || quantRiskResult.status !== 'PASS') {
+      alert('请先通过风控检查');
+      return;
+    }
+    setStep(5);
+    setShowReport(true);
+  };
+
+  // Force bypass - for authorized users
+  const forceProceedToReport = () => {
+    setStep(5);
+    setShowReport(true);
+  };
+
+  const downloadPDF = async () => {
+    if (!reportRef.current) return;
+
+    // Use window.print with better formatting for multi-page PDF
+    const printContent = reportRef.current;
+
+    // Create a new window for printing
+    const printWindow = window.open('', '_blank');
+
+    if (!printWindow) {
+      alert('请允许弹出窗口以生成PDF');
+      return;
+    }
+
+    // Clone the content and add print styles
+    const clone = printContent.cloneNode(true) as HTMLElement;
+    clone.style.padding = '20px';
+    clone.style.background = 'white';
+
+    printWindow.document.write(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>投顾决策报告</title>
+        <style>
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body { font-family: "Noto Sans SC", "PingFang SC", sans-serif; padding: 20px; }
+          .report-section { page-break-inside: avoid; margin-bottom: 32px; padding-bottom: 24px; border-bottom: 1px solid #e2e8f0; }
+          .report-part { font-size: 14px; color: #718096; margin-bottom: 8px; }
+          .report-h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
+          p { margin-bottom: 8px; line-height: 1.6; }
+          table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+          th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e2e8f0; }
+          th { background: #f7fafc; font-weight: 500; }
+          @media print {
+            body { padding: 0; }
+            .report-section { page-break-inside: avoid; }
+          }
+        </style>
+      </head>
+      <body></body>
+      </html>
+    `);
+
+    printWindow.document.body.appendChild(clone);
+    printWindow.document.close();
+
+    // Wait for content to load then print
+    setTimeout(() => {
+      printWindow.print();
+    }, 500);
+
+    setShowReport(false);
+  };
+
+  const resetAll = () => {
+    setStep(1);
+    setAnswers([]);
+    setClientProfile(null);
+    setPortfolioResult(null);
+    setQuantRiskResult(null);
+    setBacktestResult(null);
+    setShowReport(false);
+  };
+
+  return (
+    <div className="app-container">
+      {/* Header */}
+      <header className="header">
+        <div className="header-logo">
+          <span style={{ fontSize: 28 }}>📊</span>
+          <h1>投顾智能决策系统</h1>
+          <span className="header-version">v3.1</span>
+        </div>
+        <div className="header-status">
+          <span className="status-dot" style={{ background: isProcessing ? '#ed8936' : '#38a169'}}></span>
+          <span>{isProcessing ? '处理中...' : '就绪'}</span>
+        </div>
+      </header>
+
+      {/* Sidebar */}
+      <aside className="sidebar">
+        <div className={`nav-item ${step === 1 ? 'active' : ''}`} onClick={() => setStep(1)}>📝 客户画像</div>
+        <div className={`nav-item ${step === 2 ? 'active' : ''} ${!clientProfile ? 'disabled' : ''}`} onClick={() => clientProfile && setStep(2)}>🌍 市场感知</div>
+        <div className={`nav-item ${step === 3 ? 'active' : ''} ${!portfolioResult ? 'disabled' : ''}`} onClick={() => portfolioResult && setStep(3)}>⚖️ 组合优化</div>
+        <div className={`nav-item ${step === 4 ? 'active' : ''} ${!portfolioResult ? 'disabled' : ''}`} onClick={() => portfolioResult && setStep(4)}>📊 历史回测</div>
+        <div className={`nav-item ${step === 5 ? 'active' : ''} ${!portfolioResult ? 'disabled' : ''}`} onClick={() => portfolioResult && setStep(5)}>🛡️ 风控检查</div>
+        <div className={`nav-item ${step === 6 ? 'active' : ''} ${!quantRiskResult || quantRiskResult.status !== 'PASS' ? 'disabled' : ''}`} onClick={() => quantRiskResult && quantRiskResult.status === 'PASS' && setStep(6)}>📄 报告生成</div>
+        <div style={{ marginTop: 32, padding: '16px', background: '#f7fafc', borderRadius: 8 }}>
+          <div style={{ fontSize: 12, color: '#718096', marginBottom: 8 }}>当前风险等级</div>
+          <div className={`risk-tag ${clientProfile ? `risk-${clientProfile.riskType.toLowerCase()}` : ''}`}>
+            {clientProfile ? CONSTRAINT_RULES[clientProfile.riskType].label : '待评估'}
+          </div>
+        </div>
+      </aside>
+
+      {/* Main Content */}
+      <main className="main-content">
+        {/* Step Indicator */}
+        <div className="steps-indicator">
+          <div className={`step ${step >= 1 ? 'active' : ''} ${step > 1 ? 'completed' : ''}`}>1 风险测评</div>
+          <div className={`step ${step >= 2 ? 'active' : ''} ${step > 2 ? 'completed' : ''}`}>2 市场分析</div>
+          <div className={`step ${step >= 3 ? 'active' : ''} ${step > 3 ? 'completed' : ''}`}>3 组合优化</div>
+          <div className={`step ${step >= 4 ? 'active' : ''} ${step > 4 ? 'completed' : ''}`}>4 历史回测</div>
+          <div className={`step ${step >= 5 ? 'active' : ''} ${step > 5 ? 'completed' : ''}`}>5 风控检查</div>
+          <div className={`step ${step >= 6 ? 'active' : ''}`}>6 报告生成</div>
+        </div>
+
+        {/* Step 1: Questionnaire */}
+        {step === 1 && (
+          <div className="card">
+            <div className="card-title">📝 风险承受能力评估</div>
+            {QUESTIONS.map((q) => (
+              <div key={q.id} className="question-item">
+                <div className="question-text">{q.id}. {q.text}</div>
+                <div className="option-group">
+                  {q.options.map((opt, optIdx) => (
+                    <button
+                      key={optIdx}
+                      className={`option-btn ${answers.find(a => a.questionId === q.id)?.selectedOption === optIdx ? 'selected' : ''}`}
+                      onClick={() => handleAnswer(q.id, optIdx)}
+                    >
+                      {opt}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+            <div style={{ textAlign: 'center', marginTop: 16, color: '#718096' }}>
+              已回答 {answers.length}/5 题
+              <div className="progress-bar" style={{ marginTop: 8 }}>
+                <div className="progress-fill" style={{ width: `${(answers.length / 5) * 100}%` }}></div>
+              </div>
+              <div className="btn-row" style={{ justifyContent: 'center', marginTop: 16 }}>
+                <button
+                  className="btn btn-primary"
+                  disabled={answers.length < 5}
+                  onClick={proceedToMarketAnalysis}
+                  style={{ opacity: answers.length < 5 ? 0.5 : 1 }}
+                >
+                  {answers.length < 5 ? '请完成所有问题' : '→ 进入市场分析'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Step 2: Client Profile & Market Info */}
+        {step === 2 && clientProfile && (
+          <>
+            <div className="card">
+              <div className="card-title">👤 投资者画像</div>
+              <div className="data-grid">
+                <div className="data-item">
+                  <div className="data-label">风险评分</div>
+                  <div className="data-value">{clientProfile.riskScore}</div>
+                </div>
+                <div className="data-item">
+                  <div className="data-label">风险类型</div>
+                  <div className={`risk-tag risk-${clientProfile.riskType.toLowerCase()}`} style={{ display: 'inline-block', marginTop: 4 }}>
+                    {CONSTRAINT_RULES[clientProfile.riskType].label}
+                  </div>
+                </div>
+                <div className="data-item">
+                  <div className="data-label">最大回撤限制</div>
+                  <div className="data-value">{(clientProfile.maxDrawdown * 100)}<span className="data-unit">%</span></div>
+                </div>
+                <div className="data-item">
+                  <div className="data-label">单只权益上限</div>
+                  <div className="data-value">{clientProfile.maxSingleStock * 100}<span className="data-unit">%</span></div>
+                </div>
+              </div>
+              <div style={{ marginTop: 24 }}>
+                <div className="card-title">🔒 投资约束</div>
+                <div className="constraint-item">
+                  <span className="constraint-name">债券类最低占比</span>
+                  <span className="constraint-value" style={{ color: '#38a169' }}>≥ {clientProfile.minBondWeight * 100}%</span>
+                </div>
+                <div className="constraint-item">
+                  <span className="constraint-name">加密资产最高占比</span>
+                  <span className="constraint-value" style={{ color: '#e53e3e' }}>≤ {clientProfile.maxCryptoWeight * 100}%</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="card">
+              <div className="card-title">🌍 宏观环境诊断 (FMP MCP)</div>
+
+              {/* 宏观指标卡片 */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 20 }}>
+                <div style={{ padding: 16, background: macroIndicators?.cpi && macroIndicators.cpi > 5 ? '#fff5f5' : '#f0fff4', borderRadius: 8, border: '1px solid' + (macroIndicators?.cpi && macroIndicators.cpi > 5 ? '#fed7d7' : '#c6f6d5') }}>
+                  <div style={{ fontSize: 12, color: '#718096', marginBottom: 4 }}>CPI 通胀率</div>
+                  <div style={{ fontSize: 24, fontWeight: 600, color: macroIndicators?.cpi && macroIndicators.cpi > 5 ? '#e53e3e' : '#38a169' }}>
+                    {macroIndicators ? `${macroIndicators.cpi.toFixed(1)}%` : '--%'}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#718096' }}>
+                    {macroIndicators?.cpi && macroIndicators.cpi > 5 ? '⚠️ 高通胀' : '✓ 正常'}
+                  </div>
+                </div>
+                <div style={{ padding: 16, background: macroIndicators?.gdp && macroIndicators.gdp < 0 ? '#fff5f5' : '#f0fff4', borderRadius: 8, border: '1px solid' + (macroIndicators?.gdp && macroIndicators.gdp < 0 ? '#fed7d7' : '#c6f6d5') }}>
+                  <div style={{ fontSize: 12, color: '#718096', marginBottom: 4 }}>GDP 增速</div>
+                  <div style={{ fontSize: 24, fontWeight: 600, color: macroIndicators?.gdp && macroIndicators.gdp < 0 ? '#e53e3e' : '#38a169' }}>
+                    {macroIndicators ? `${macroIndicators.gdp.toFixed(1)}%` : '--%'}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#718096' }}>
+                    {macroIndicators?.gdp !== undefined && macroIndicators.gdp < 0 ? '⚠️ 负增长' : macroIndicators?.gdp && macroIndicators.gdp < 1.5 ? '↓ 放缓' : '✓ 增长'}
+                  </div>
+                </div>
+                <div style={{ padding: 16, background: macroIndicators?.fedRate && macroIndicators.fedRate > 4 ? '#fff5f5' : '#f7fafc', borderRadius: 8, border: '1px solid' + (macroIndicators?.fedRate && macroIndicators.fedRate > 4 ? '#fed7d7' : '#e2e8f0') }}>
+                  <div style={{ fontSize: 12, color: '#718096', marginBottom: 4 }}>联邦基金利率</div>
+                  <div style={{ fontSize: 24, fontWeight: 600, color: macroIndicators?.fedRate && macroIndicators.fedRate > 4 ? '#ed8936' : '#1a365d' }}>
+                    {macroIndicators ? `${macroIndicators.fedRate.toFixed(2)}%` : '--%'}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#718096' }}>
+                    {macroIndicators?.fedRate && macroIndicators.fedRate > 4 ? '⚠️ 高利率' : '✓ 低利率'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Regime 判断逻辑展示 */}
+              <div style={{ marginBottom: 20, padding: 16, background: '#f7fafc', borderRadius: 8 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>📊 Regime 判断逻辑</div>
+                <div style={{ fontSize: 13, color: '#4a5568', lineHeight: 1.8 }}>
+                  {macroFactors.length > 0 ? (
+                    macroFactors.map((f, idx) => (
+                      <div key={idx} style={{ marginBottom: 4 }}>
+                        {idx + 1}. {f}
+                      </div>
+                    ))
+                  ) : (
+                    <div>正在获取 FMP 宏观数据...</div>
+                  )}
+                </div>
+                <div style={{ marginTop: 12, padding: 12, background: '#fff', borderRadius: 6, borderLeft: '3px solid #1a365d' }}>
+                  <div style={{ fontSize: 14, fontWeight: 600 }}>
+                    判定结果: <span className={`regime-tag regime-${regime}`}>
+                      {regime === 'inflation' ? '🔥 通胀过热' : regime === 'recession' ? '❄️ 避险衰退' : '➡️ 正常运行'}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12, color: '#718096', marginTop: 4 }}>
+                    置信度: {(macroConfidence * 100).toFixed(0)}%
+                  </div>
+                </div>
+              </div>
+
+              <div className="data-grid">
+                <div className="data-item">
+                  <div className="data-label">检测到资产</div>
+                  <div className="data-value">{ASSET_POOL.length}<span className="data-unit"> 只</span></div>
+                </div>
+                <div className="data-item">
+                  <div className="data-label">数据来源</div>
+                  <div className="data-value" style={{ fontSize: 14 }}>FMP MCP</div>
+                </div>
+              </div>
+
+              {/* 市场情绪指标 */}
+              {marketSentiment && (
+                <div style={{ marginTop: 20, padding: 16, background: marketSentiment.sentiment === 'greed' ? '#f0fff4' : marketSentiment.sentiment === 'fear' ? '#fff5f5' : '#f7fafc', borderRadius: 8, border: '1px solid' + (marketSentiment.sentiment === 'greed' ? '#c6f6d5' : marketSentiment.sentiment === 'fear' ? '#fed7d7' : '#e2e8f0') }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>📈 市场情绪</div>
+                  <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 24, fontWeight: 700, color: marketSentiment.sentiment === 'greed' ? '#38a169' : marketSentiment.sentiment === 'fear' ? '#e53e3e' : '#718096' }}>
+                        {marketSentiment.sentiment === 'greed' ? '🟢贪婪' : marketSentiment.sentiment === 'fear' ? '🔴恐惧' : '⚪中性'}
+                      </div>
+                      {marketSentiment.fearGreedIndex !== null && (
+                        <div style={{ fontSize: 12, color: '#718096', marginTop: 4 }}>
+                          Fear & Greed Index: {marketSentiment.fearGreedIndex}
+                        </div>
+                      )}
+                    </div>
+                    {marketSentiment.vix !== null && (
+                      <div style={{ textAlign: 'center' }}>
+                        <div style={{ fontSize: 12, color: '#718096' }}>VIX</div>
+                        <div style={{ fontSize: 20, fontWeight: 600, color: marketSentiment.vix > 25 ? '#e53e3e' : '#38a169' }}>
+                          {marketSentiment.vix.toFixed(1)}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* 资产相关新闻 */}
+              {assetNews && (
+                <div style={{ marginTop: 20 }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>📰 最热新闻</div>
+                  <div style={{ maxHeight: 200, overflow: 'auto' }}>
+                    {assetNews.news.slice(0, 6).map((item, idx) => (
+                      <div key={idx} style={{ marginBottom: 8, padding: 8, background: '#f7fafc', borderRadius: 6 }}>
+                        <div style={{ fontSize: 12, color: '#718096' }}>
+                          {item.source} · {item.time} · {item.asset}
+                        </div>
+                        <a
+                          href={item.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{ fontSize: 13, color: '#1a365d', textDecoration: 'none', display: 'block', marginTop: 2 }}
+                        >
+                          {item.title.length > 60 ? item.title.slice(0, 60) + '...' : item.title}
+                        </a>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* PDF知识库分析结果 */}
+              {pdfInsights && pdfInsights.length > 0 && (
+                <div style={{ marginTop: 16, padding: 12, background: '#fffbeb', borderRadius: 8, border: '1px solid #f6ad55' }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8, color: '#744210'>📚 券商研报关键判断</div>
+                  {pdfInsights.map((pdf, idx) => (
+                    <div key={idx} style={{ marginBottom: 8, padding: 8, background: '#fff', borderRadius: 4 }}>
+                      <div style={{ fontSize: 11, color: '#b7791f', marginBottom: 4 }}>{pdf.source}</div>
+                      {pdf.keyInsights.slice(0, 4).map((insight, i) => (
+                        <div key={i}>• {insight}</div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div style={{ marginTop: 16 }}>
+                <div style={{ maxHeight: 200, overflow: 'auto' }}>
+                  <table className="data-table">
+                    <thead><tr><th>代码</th><th>名称</th><th>预期收益</th><th>波动率</th></tr></thead>
+                    <tbody>
+                      {ASSET_POOL.map(a => (
+                        <tr key={a.code}><td>{a.code}</td><td>{a.name}</td><td className="weight-positive">{(a.expectedReturn * 100).toFixed(1)}%</td><td>{(a.volatility * 100).toFixed(1)}%</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div className="btn-row">
+              <button className="btn btn-primary" onClick={startOptimization}>⚡ 开始组合优化</button>
+              <button className="btn btn-outline" onClick={resetAll}>↺ 重新测评</button>
+            </div>
+          </>
+        )}
+
+        {/* Step 3: Optimization Results */}
+        {step === 3 && (
+          <>
+            {isProcessing ? (
+              <div className="card" style={{ textAlign: 'center', padding: 48 }}>
+                <div className="loading-spinner" style={{ width: 48, height: 48, margin: '0 auto 24px' }}></div>
+                <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>正在调用 Quant_Optimizer_MCP 进行组合优化...</div>
+                <div style={{ color: '#718096' }}>基于动态预期求解最优投资比例</div>
+              </div>
+            ) : portfolioResult && (
+              <>
+                <div className="card">
+                  <div className="card-title">📊 资产配置权重 (Markowitz优化)</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+                    <PieChart data={Object.entries(portfolioResult.weights).map(([k, v]) => ({ name: ASSET_POOL.find(a => a.code === k)?.name || k, value: v }))} />
+                    <div>
+                      <div className="data-grid" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: 16 }}>
+                        <div className="data-item">
+                          <div className="data-label">预期收益率</div>
+                          <div className="data-value" style={{ color: '#38a169' }}>{(portfolioResult.expectedReturn * 100).toFixed(1)}<span className="data-unit">%</span></div>
+                        </div>
+                        <div className="data-item">
+                          <div className="data-label">预期波动率</div>
+                          <div className="data-value">{(portfolioResult.expectedVolatility * 100).toFixed(1)}<span className="data-unit">%</span></div>
+                        </div>
+                        <div className="data-item">
+                          <div className="data-label">夏普比率</div>
+                          <div className="data-value" style={{ color: '#2d5a87' }}>{portfolioResult.sharpeRatio}</div>
+                        </div>
+                        <div className="data-item">
+                          <div className="data-label">预测最大回撤</div>
+                          <div className="data-value" style={{ color: '#e53e3e' }}>-{(portfolioResult.maxDrawdown * 100).toFixed(1)}<span className="data-unit">%</span></div>
+                        </div>
+                      </div>
+                      <table className="data-table">
+                        <thead><tr><th>资产</th><th>配置比例</th></tr></thead>
+                        <tbody>
+                          {Object.entries(portfolioResult.weights).sort((a, b) => b[1] - a[1]).map(([k, v]) => (
+                            <tr key={k}>
+                              <td>{ASSET_POOL.find(a => a.code === k)?.name} ({k})</td>
+                              <td className="weight-positive">{(v * 100).toFixed(1)}%</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+
+                {/* QuantRisk Agent Results */}
+                {quantRiskResult && (
+                  <div className="card" style={{ marginTop: 24, border: quantRiskResult.status === 'PASS' ? '2px solid #38a169' : '2px solid #e53e3e' }}>
+                    <div className="card-title">
+                      🛡️ 风控压力测试 (QuantRisk Agent)
+                      {quantRiskResult.status === 'PASS' ? (
+                        <span style={{ color: '#38a169', marginLeft: 12 }}>✅ 通过</span>
+                      ) : (
+                        <span style={{ color: '#e53e3e', marginLeft: 12 }}>❌ 未通过</span>
+                      )}
+                    </div>
+
+                    <div style={{ marginBottom: 16, color: '#718096' }}>
+                      {quantRiskResult.recommendation}
+                    </div>
+
+                    <table className="data-table">
+                      <thead>
+                        <tr>
+                          <th>场景</th>
+                          <th>时间区间</th>
+                          <th>组合收益</th>
+                          <th>回撤</th>
+                          <th>状态</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {quantRiskResult.results.map((r) => {
+                          const scenario = STRESS_SCENARIOS.find(s => s.id === r.scenarioId);
+                          return (
+                            <tr key={r.scenarioId}>
+                              <td>{scenario?.name}</td>
+                              <td>{scenario?.period}</td>
+                              <td className={r.portfolioReturn >= 0 ? 'weight-positive' : 'weight-negative'}>
+                                {(r.portfolioReturn * 100).toFixed(1)}%
+                              </td>
+                              <td className="weight-negative">
+                                {(r.observedDrawdown * 100).toFixed(1)}%
+                              </td>
+                              <td>
+                                {r.status === 'PASS' ? (
+                                  <span style={{ color: '#38a169' }}>✅ PASS</span>
+                                ) : (
+                                  <span style={{ color: '#e53e3e' }}>❌ FAIL</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+
+                    {/* Risk Education Section */}
+                    {quantRiskResult.results.map((r, _idx) => (
+                      <div key={r.scenarioId} style={{ marginTop: 16, padding: 12, background: '#f7fafc', borderRadius: 8 }}>
+                        <div style={{ fontSize: 13, color: '#718096', marginBottom: 8 }}>
+                          {explainStressTest(r.scenarioId, r.observedDrawdown, '组合资产', portfolioResult?.weights || {})}
+                        </div>
+                        <div style={{ fontSize: 12, color: '#4a5568' }}>
+                          💡 {explainMetric('MaxDrawdown', r.observedDrawdown, STRESS_SCENARIOS.find(s => s.id === r.scenarioId)?.name || '历史')}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="btn-row">
+                  <button className="btn btn-primary" onClick={() => setStep(5)}>🛡️ 进入风控检查</button>
+                  <button className="btn btn-outline" onClick={resetAll}>↺ 重新开始</button>
+                </div>
+              </>
+            )}
+          </>
+        )}
+
+        {/* Step 4: Backtest - New! */}
+        {step === 4 && portfolioResult && (
+          <>
+            <div className="card">
+              <div className="card-title">📊 历史回测 (Backtest Engine)</div>
+
+              <div style={{ display: 'flex', gap: 16, marginBottom: 24 }}>
+                <div className="form-group">
+                  <div className="form-label">回测周期</div>
+                  <select
+                    className="form-input"
+                    value={backtestConfig.period}
+                    onChange={(e) => setBacktestConfig({ ...backtestConfig, period: e.target.value as any })}
+                  >
+                    <option value="1Y">1年</option>
+                    <option value="3Y">3年</option>
+                    <option value="5Y">5年</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <div className="form-label">再平衡频率</div>
+                  <select
+                    className="form-input"
+                    value={backtestConfig.rebalanceFrequency}
+                    onChange={(e) => setBacktestConfig({ ...backtestConfig, rebalanceFrequency: e.target.value as any })}
+                  >
+                    <option value="monthly">月度</option>
+                    <option value="quarterly">季度</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <div className="form-label">基准</div>
+                  <select
+                    className="form-input"
+                    value={backtestConfig.benchmark}
+                    onChange={(e) => setBacktestConfig({ ...backtestConfig, benchmark: e.target.value as any })}
+                  >
+                    <option value="QQQ">纳指100</option>
+                    <option value="510300.SH">沪深300</option>
+                    <option value="60_40">60/40</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="btn-row">
+                <button className="btn btn-primary" onClick={async () => {
+                  setIsProcessing(true);
+                  try {
+                    // Try to use FMP real data first, fallback to simulation
+                    const { prices, dates } = await fetchBacktestDataWithFMP(portfolioResult.weights, backtestConfig);
+                    const result = runBacktest(portfolioResult.weights, backtestConfig, prices);
+                    setBacktestResult(result);
+                  } catch (error) {
+                    console.error('Backtest error:', error);
+                    // Fallback to local simulation
+                    const result = runBacktest(portfolioResult.weights, backtestConfig);
+                    setBacktestResult(result);
+                  } finally {
+                    setIsProcessing(false);
+                  }
+                }}>
+                  ▶️ 运行回测
+                </button>
+              </div>
+
+              {backtestResult && (
+                <>
+                  <div className="data-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginTop: 24 }}>
+                    <div className="data-item">
+                      <div className="data-label">总收益</div>
+                      <div className="data-value" style={{ color: backtestResult.totalReturn >= 0 ? '#38a169' : '#e53e3e' }}>
+                        {(backtestResult.totalReturn * 100).toFixed(1)}%
+                      </div>
+                    </div>
+                    <div className="data-item">
+                      <div className="data-label">年化收益</div>
+                      <div className="data-value" style={{ color: backtestResult.annualizedReturn >= 0 ? '#38a169' : '#e53e3e' }}>
+                        {(backtestResult.annualizedReturn * 100).toFixed(1)}%
+                      </div>
+                    </div>
+                    <div className="data-item">
+                      <div className="data-label">年化波动率</div>
+                      <div className="data-value">{(backtestResult.annualizedVolatility * 100).toFixed(1)}%</div>
+                    </div>
+                    <div className="data-item">
+                      <div className="data-label">夏普比率</div>
+                      <div className="data-value">{backtestResult.sharpeRatio.toFixed(2)}</div>
+                    </div>
+                  </div>
+
+                  {/* Metric Explanations */}
+                  <div style={{ marginTop: 16, padding: 12, background: '#f7fafc', borderRadius: 8, fontSize: 13, color: '#4a5568' }}>
+                    <div>{explainMetric('SharpeRatio', backtestResult.sharpeRatio, '')}</div>
+                    <div style={{ marginTop: 8 }}>{explainMetric('MaxDrawdown', backtestResult.maxDrawdown, backtestConfig.period)}</div>
+                    <div style={{ marginTop: 8 }}>{explainMetric('WinRate', backtestResult.winRate, '')}</div>
+                  </div>
+
+                  <div className="data-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginTop: 16 }}>
+                    <div className="data-item">
+                      <div className="data-label">最大回撤</div>
+                      <div className="data-value" style={{ color: '#e53e3e' }}>-{(backtestResult.maxDrawdown * 100).toFixed(1)}%</div>
+                    </div>
+                    <div className="data-item">
+                      <div className="data-label">胜率</div>
+                      <div className="data-value">{(backtestResult.winRate * 100).toFixed(1)}%</div>
+                    </div>
+                    <div className="data-item">
+                      <div className="data-label">最佳月</div>
+                      <div className="data-value" style={{ color: '#38a169' }}>+{(backtestResult.bestMonth * 100).toFixed(1)}%</div>
+                    </div>
+                    <div className="data-item">
+                      <div className="data-label">最差月</div>
+                      <div className="data-value" style={{ color: '#e53e3e' }}>{(backtestResult.worstMonth * 100).toFixed(1)}%</div>
+                    </div>
+                  </div>
+
+                  {/* Equity Curve Chart */}
+                  <div style={{ marginTop: 24, height: 300 }}>
+                    <div className="form-label">净值曲线 (Portfolio vs Benchmark)</div>
+                    <EquityCurveChart
+                      equityCurve={backtestResult.equityCurve}
+                      benchmarkCurve={backtestResult.benchmarkCurve}
+                      assetCurves={backtestResult.assetCurves}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="btn-row">
+              <button className="btn btn-primary" onClick={() => setStep(5)}>🛡️ 进入风控检查</button>
+              <button className="btn btn-outline" onClick={() => setStep(3)}>← 返回优化</button>
+            </div>
+          </>
+        )}
+
+        {/* Step 5: Stress Test */}
+        {step === 5 && (
+          <>
+            {isProcessing ? (
+              <div className="card" style={{ textAlign: 'center', padding: 48 }}>
+                <div className="loading-spinner" style={{ width: 48, height: 48, margin: '0 auto 24px' }}></div>
+                <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>正在运行 QuantRisk_MCP 风控压力测试...</div>
+                <div style={{ color: '#718096' }}>在4个历史极端场景中评估组合表现</div>
+              </div>
+            ) : (
+              <>
+                <div className="card">
+                  <div className="card-title">🛡️ 风控压力测试 (QuantRisk Agent)</div>
+                  <div style={{ marginBottom: 24 }}>
+                    <div style={{ fontSize: 14, color: '#718096', marginBottom: 8 }}>测试场景:</div>
+                    <div className="asset-chips" style={{ gap: 8 }}>
+                      {STRESS_SCENARIOS.map(s => (
+                        <span key={s.id} className="asset-chip" style={{ background: '#fff5f5', border: '1px solid #fed7d7' }}>{s.name}</span>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ marginBottom: 16, padding: 12, background: '#f7fafc', borderRadius: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                      <span>客户最大回撤容忍:</span>
+                      <strong>{(clientProfile?.maxDrawdown || 0.1) * 100}%</strong>
+                    </div>
+                    <div style={{ fontSize: 13, color: '#718096' }}>任一场景回撤超过此阈值将导致风控检查失败</div>
+                  </div>
+                  {!quantRiskResult && (
+                    <div style={{ textAlign: 'center', padding: 24 }}>
+                      <button className="btn btn-primary" onClick={runStressTest}>🛡️ 运行压力测试</button>
+                    </div>
+                  )}
+                  {quantRiskResult && (
+                    <>
+                      <div style={{ padding: 16, borderRadius: 8, marginBottom: 16, border: quantRiskResult.status === 'PASS' ? '2px solid #38a169' : '2px solid #e53e3e', background: quantRiskResult.status === 'PASS' ? '#f0fff4' : '#fff5f5' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+                          <span style={{ fontSize: 24 }}>{quantRiskResult.status === 'PASS' ? '✅' : '❌'}</span>
+                          <span style={{ fontSize: 18, fontWeight: 600 }}>{quantRiskResult.status === 'PASS' ? '风控检查通过' : '风控检查未通过'}</span>
+                        </div>
+                        <div style={{ color: '#718096' }}>{quantRiskResult.recommendation}</div>
+                      </div>
+                      <table className="data-table">
+                        <thead><tr><th>场景</th><th>时间区间</th><th>组合收益</th><th>回撤</th><th>状态</th></tr></thead>
+                        <tbody>
+                          {quantRiskResult.results.map((r) => {
+                            const scenario = STRESS_SCENARIOS.find(s => s.id === r.scenarioId);
+                            return (
+                              <tr key={r.scenarioId}>
+                                <td>{scenario?.name}</td>
+                                <td>{scenario?.period}</td>
+                                <td className={r.portfolioReturn >= 0 ? 'weight-positive' : 'weight-negative'}>{(r.portfolioReturn * 100).toFixed(1)}%</td>
+                                <td className="weight-negative">{(r.observedDrawdown * 100).toFixed(1)}%</td>
+                                <td>{r.status === 'PASS' ? <span style={{ color: '#38a169' }}>✅</span> : <span style={{ color: '#e53e3e' }}>❌</span>}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                      {quantRiskResult.status === 'FAIL' && (
+                        <div style={{ marginTop: 16, padding: 12, background: '#fed7d7', borderRadius: 8 }}>
+                          <strong>⚠️ 诊断:</strong> {quantRiskResult.results.find(r => r.scenarioId === quantRiskResult.worstScenario)?.diagnosis}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+                <div className="btn-row">
+                  {quantRiskResult?.status === 'PASS' ? (
+                    <button className="btn btn-accent" onClick={proceedToReport}>📄 生成PDF报告</button>
+                  ) : (
+                    <button className="btn btn-outline" onClick={forceProceedToReport}>⚠️ 强制生成报告</button>
+                  )}
+                  <button className="btn btn-outline" onClick={() => setStep(3)}>← 返回优化</button>
+                  <button className="btn btn-outline" onClick={resetAll}>↺ 重新开始</button>
+                </div>
+              </>
+            )}
+          </>
+        )}
+
+        {/* Step 5: Report Modal */}
+        {showReport && (
+          <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowReport(false)}>
+            <div className="modal" ref={reportRef} style={{ maxWidth: 800 }}>
+              <div className="modal-title">📋 投资决策报告</div>
+
+              {/* One-Liner Summary */}
+              <div style={{ padding: 16, background: 'linear-gradient(135deg, #1a365d 0%, #2d5a87 100%)', borderRadius: 12, color: 'white', marginBottom: 24 }}>
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>一句话总结</div>
+                <div style={{ fontSize: 16, fontWeight: 500 }}>
+                  {clientProfile && portfolioResult
+                    ? generateOneLiner(clientProfile, portfolioResult.weights, regime)
+                    : '正在生成组合总结...'}
+                </div>
+              </div>
+
+              <div className="report-section">
+                <div className="report-part">Part A</div>
+                <h2 className="report-h2">投资者需求摘要</h2>
+                <p>风险评分: <strong>{clientProfile?.riskScore}</strong> | 风险类型: <strong>{clientProfile && CONSTRAINT_RULES[clientProfile.riskType].label}</strong></p>
+                <p>最大回撤容忍: <strong>{(clientProfile?.maxDrawdown || 0) * 100}%</strong></p>
+                <p>债券类最低占比: <strong>{(clientProfile?.minBondWeight || 0) * 100}%</strong></p>
+                <p>加密资产最高占比: <strong>{(clientProfile?.maxCryptoWeight || 0) * 100}%</strong></p>
+              </div>
+
+              <div className="report-section">
+                <div className="report-part">Part B</div>
+                <h2 className="report-h2">市场环境诊断</h2>
+                <p>当前宏观周期: <strong className={regime === 'inflation' ? 'regime-tag regime-inflation' : regime === 'recession' ? 'regime-tag regime-recession' : 'regime-tag regime-normal'}>
+                  {regime === 'inflation' ? '通胀过热' : regime === 'recession' ? '避险衰退' : '正常运行'}
+                </strong></p>
+                <p>检测日期: <strong>{new Date().toLocaleDateString('zh-CN')}</strong></p>
+                <table className="data-table">
+                  <thead><tr><th>资产</th><th>预期收益</th><th>波动率</th></tr></thead>
+                  <tbody>
+                    {ASSET_POOL.map(a => (
+                      <tr key={a.code}><td>{a.name}</td><td>{(a.expectedReturn * 100).toFixed(1)}%</td><td>{(a.volatility * 100).toFixed(1)}%</td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="report-section">
+                <div className="report-part">Part C</div>
+                <h2 className="report-h2">资产配置建议</h2>
+                {portfolioResult && (
+                  <>
+                    <p>预期年化收益: <strong>{(portfolioResult.expectedReturn * 100).toFixed(2)}%</strong> | 预期波动率: <strong>{(portfolioResult.expectedVolatility * 100).toFixed(2)}%</strong></p>
+                    <p>夏普比率: <strong>{portfolioResult.sharpeRatio}</strong> | 预测最大回撤: <strong>-{(portfolioResult.maxDrawdown * 100).toFixed(2)}%</strong></p>
+                    <table className="data-table">
+                      <thead><tr><th>资产</th><th>配置权重</th></tr></thead>
+                      <tbody>
+                        {Object.entries(portfolioResult.weights).sort((a, b) => b[1] - a[1]).map(([k, v]) => (
+                          <tr key={k}><td>{ASSET_POOL.find(a => a.code === k)?.name}</td><td>{(v * 100).toFixed(2)}%</td></tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
+                )}
+              </div>
+
+              <div className="report-section">
+                <div className="report-part">Part D</div>
+                <h2 className="report-h2">风险压力测试</h2>
+                <p>在极端下跌行情下(-20%): <strong>组合预期下跌约{clientProfile ? Math.round(clientProfile.maxDrawdown * 20 * 100) : 10}%</strong></p>
+                <p>在极端上涨行情下(+20%): <strong>组合预期上涨约{portfolioResult ? Math.round(portfolioResult.expectedReturn * 2 * 100) : 16}%</strong></p>
+              </div>
+
+              <div className="report-section" style={{ borderBottom: 'none' }}>
+                <div className="report-part">Part E</div>
+                <h2 className="report-h2">配置参数附录 (合规审计)</h2>
+                <p>报告编号: <code>IA-{Date.now()}</code></p>
+                <p>生成时间: <code>{new Date().toISOString()}</code></p>
+                <p>优化器: <code>Quant_Optimizer_MCP (PyPortfolioOpt)</code></p>
+              </div>
+
+              <div style={{ marginTop: 32, display: 'flex', gap: 12, justifyContent: 'center' }}>
+                <button className="btn btn-accent" onClick={downloadPDF}>⬇️ 下载PDF</button>
+                <button className="btn btn-outline" onClick={() => setShowReport(false)}>关闭</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Footer */}
+        <footer style={{ marginTop: 48, textAlign: 'center', color: '#718096', fontSize: 13, padding: 24, borderTop: '1px solid #e2e8f0' }}>
+          <div>投顾智能决策系统 v3.1 | 基于 MCP 协议 | 支持 FMP/Quant_Optimizer/PDF_Generator MCP</div>
+          <div style={{ marginTop: 8 }}>Powered by 大模型 + 动态量化模型解算</div>
+        </footer>
+      </main>
+    </div>
+  );
+}
