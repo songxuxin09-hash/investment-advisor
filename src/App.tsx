@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-const MCP_SERVER_URL = 'http://localhost:8001';
+const MCP_SERVER_URL = 'https://investment-advisor-api-my3u.onrender.com';
 import ReactECharts from 'echarts-for-react';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
